@@ -61,7 +61,7 @@ namespace NzbDrone.Common.Http.Dispatchers
                 requestMessage.Headers.Add("Cookie", cookieHeader);
             }
 
-            using var cts = new CancellationTokenSource();
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(request.CancellationToken);
             if (request.RequestTimeout != TimeSpan.Zero)
             {
                 cts.CancelAfter(request.RequestTimeout);
@@ -125,7 +125,7 @@ namespace NzbDrone.Common.Http.Dispatchers
                             data = await responseMessage.Content.ReadAsByteArrayAsync(cts.Token);
                         }
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (!(ex is OperationCanceledException && request.CancellationToken.IsCancellationRequested))
                     {
                         throw new WebException("Failed to read complete http response", ex, WebExceptionStatus.ReceiveFailure, null);
                     }
@@ -158,7 +158,7 @@ namespace NzbDrone.Common.Http.Dispatchers
                     return new HttpResponse(request, new HttpHeader(headers), cookieCollection, data, sw.ElapsedMilliseconds, responseMessage.StatusCode, responseMessage.Version);
                 }
             }
-            catch (OperationCanceledException ex) when (cts.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (cts.IsCancellationRequested && !request.CancellationToken.IsCancellationRequested)
             {
                 throw new WebException("Http request timed out", ex, WebExceptionStatus.Timeout, null);
             }

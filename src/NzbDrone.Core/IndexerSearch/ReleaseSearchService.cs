@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using NLog;
 using NzbDrone.Common.Instrumentation.Extensions;
@@ -17,6 +18,14 @@ namespace NzbDrone.Core.IndexerSearch
     public interface IReleaseSearchService
     {
         Task<NewznabResults> Search(NewznabRequest request, List<int> indexerIds, bool interactiveSearch);
+        Task<NewznabResults> Search(NewznabRequest request, List<int> indexerIds, bool interactiveSearch, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Starts a search that publishes batches of releases as indexer result pages complete.
+        /// Request validation errors are thrown synchronously; search failures surface while reading.
+        /// Releases are de-duplicated by guid (first seen wins) across the whole stream.
+        /// </summary>
+        NewznabSearchStream SearchStream(NewznabRequest request, List<int> indexerIds, bool interactiveSearch, CancellationToken cancellationToken);
     }
 
     public class ReleaseSearchService : IReleaseSearchService
@@ -39,95 +48,109 @@ namespace NzbDrone.Core.IndexerSearch
 
         public Task<NewznabResults> Search(NewznabRequest request, List<int> indexerIds, bool interactiveSearch)
         {
-            return request.t switch
+            return Search(request, indexerIds, interactiveSearch, CancellationToken.None);
+        }
+
+        public async Task<NewznabResults> Search(NewznabRequest request, List<int> indexerIds, bool interactiveSearch, CancellationToken cancellationToken)
+        {
+            var (searchSpec, searchAction) = Prepare(request, indexerIds, interactiveSearch);
+
+            searchSpec.CancellationToken = cancellationToken;
+
+            var releases = await Dispatch(searchAction, searchSpec);
+
+            return new NewznabResults { Releases = DeDupeReleases(releases) };
+        }
+
+        public NewznabSearchStream SearchStream(NewznabRequest request, List<int> indexerIds, bool interactiveSearch, CancellationToken cancellationToken)
+        {
+            var (searchSpec, searchAction) = Prepare(request, indexerIds, interactiveSearch);
+
+            return new NewznabSearchStream(
+                async (token, publish) =>
+                {
+                    searchSpec.CancellationToken = token;
+
+                    await Dispatch(searchAction, searchSpec, publish);
+                },
+                cancellationToken);
+        }
+
+        private (SearchCriteriaBase Spec, Func<IIndexer, Task<IndexerPageableQueryResult>> Action) Prepare(NewznabRequest request, List<int> indexerIds, bool interactiveSearch)
+        {
+            switch (request.t)
             {
-                "movie" => MovieSearch(request, indexerIds, interactiveSearch),
-                "music" => MusicSearch(request, indexerIds, interactiveSearch),
-                "tvsearch" => TvSearch(request, indexerIds, interactiveSearch),
-                "book" => BookSearch(request, indexerIds, interactiveSearch),
-                _ => BasicSearch(request, indexerIds, interactiveSearch)
-            };
-        }
+                case "movie":
+                    {
+                        var searchSpec = Get<MovieSearchCriteria>(request, indexerIds, interactiveSearch);
 
-        private async Task<NewznabResults> MovieSearch(NewznabRequest request, List<int> indexerIds, bool interactiveSearch)
-        {
-            var searchSpec = Get<MovieSearchCriteria>(request, indexerIds, interactiveSearch);
+                        var imdbId = ParseUtil.GetImdbId(request.imdbid);
 
-            var imdbId = ParseUtil.GetImdbId(request.imdbid);
+                        searchSpec.ImdbId = imdbId?.ToString("D7");
+                        searchSpec.TmdbId = request.tmdbid;
+                        searchSpec.TraktId = request.traktid;
+                        searchSpec.DoubanId = request.doubanid;
+                        searchSpec.Year = request.year;
+                        searchSpec.Genre = request.genre;
 
-            searchSpec.ImdbId = imdbId?.ToString("D7");
-            searchSpec.TmdbId = request.tmdbid;
-            searchSpec.TraktId = request.traktid;
-            searchSpec.DoubanId = request.doubanid;
-            searchSpec.Year = request.year;
-            searchSpec.Genre = request.genre;
+                        return (searchSpec, indexer => indexer.Fetch(searchSpec));
+                    }
 
-            var releases = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+                case "music":
+                    {
+                        var searchSpec = Get<MusicSearchCriteria>(request, indexerIds, interactiveSearch);
 
-            return new NewznabResults { Releases = DeDupeReleases(releases) };
-        }
+                        searchSpec.Artist = request.artist;
+                        searchSpec.Album = request.album;
+                        searchSpec.Label = request.label;
+                        searchSpec.Genre = request.genre;
+                        searchSpec.Track = request.track;
+                        searchSpec.Year = request.year;
 
-        private async Task<NewznabResults> MusicSearch(NewznabRequest request, List<int> indexerIds, bool interactiveSearch)
-        {
-            var searchSpec = Get<MusicSearchCriteria>(request, indexerIds, interactiveSearch);
+                        return (searchSpec, indexer => indexer.Fetch(searchSpec));
+                    }
 
-            searchSpec.Artist = request.artist;
-            searchSpec.Album = request.album;
-            searchSpec.Label = request.label;
-            searchSpec.Genre = request.genre;
-            searchSpec.Track = request.track;
-            searchSpec.Year = request.year;
+                case "tvsearch":
+                    {
+                        var searchSpec = Get<TvSearchCriteria>(request, indexerIds, interactiveSearch);
 
-            var releases = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+                        var imdbId = ParseUtil.GetImdbId(request.imdbid);
 
-            return new NewznabResults { Releases = DeDupeReleases(releases) };
-        }
+                        searchSpec.ImdbId = imdbId?.ToString("D7");
+                        searchSpec.Season = request.season;
+                        searchSpec.Episode = request.ep;
+                        searchSpec.TvdbId = request.tvdbid;
+                        searchSpec.TraktId = request.traktid;
+                        searchSpec.TmdbId = request.tmdbid;
+                        searchSpec.DoubanId = request.doubanid;
+                        searchSpec.RId = request.rid;
+                        searchSpec.TvMazeId = request.tvmazeid;
+                        searchSpec.Year = request.year;
+                        searchSpec.Genre = request.genre;
 
-        private async Task<NewznabResults> TvSearch(NewznabRequest request, List<int> indexerIds, bool interactiveSearch)
-        {
-            var searchSpec = Get<TvSearchCriteria>(request, indexerIds, interactiveSearch);
+                        return (searchSpec, indexer => indexer.Fetch(searchSpec));
+                    }
 
-            var imdbId = ParseUtil.GetImdbId(request.imdbid);
+                case "book":
+                    {
+                        var searchSpec = Get<BookSearchCriteria>(request, indexerIds, interactiveSearch);
 
-            searchSpec.ImdbId = imdbId?.ToString("D7");
-            searchSpec.Season = request.season;
-            searchSpec.Episode = request.ep;
-            searchSpec.TvdbId = request.tvdbid;
-            searchSpec.TraktId = request.traktid;
-            searchSpec.TmdbId = request.tmdbid;
-            searchSpec.DoubanId = request.doubanid;
-            searchSpec.RId = request.rid;
-            searchSpec.TvMazeId = request.tvmazeid;
-            searchSpec.Year = request.year;
-            searchSpec.Genre = request.genre;
+                        searchSpec.Author = request.author;
+                        searchSpec.Title = request.title;
+                        searchSpec.Publisher = request.publisher;
+                        searchSpec.Year = request.year;
+                        searchSpec.Genre = request.genre;
 
-            var releases = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+                        return (searchSpec, indexer => indexer.Fetch(searchSpec));
+                    }
 
-            return new NewznabResults { Releases = DeDupeReleases(releases) };
-        }
+                default:
+                    {
+                        var searchSpec = Get<BasicSearchCriteria>(request, indexerIds, interactiveSearch);
 
-        private async Task<NewznabResults> BookSearch(NewznabRequest request, List<int> indexerIds, bool interactiveSearch)
-        {
-            var searchSpec = Get<BookSearchCriteria>(request, indexerIds, interactiveSearch);
-
-            searchSpec.Author = request.author;
-            searchSpec.Title = request.title;
-            searchSpec.Publisher = request.publisher;
-            searchSpec.Year = request.year;
-            searchSpec.Genre = request.genre;
-
-            var releases = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
-
-            return new NewznabResults { Releases = DeDupeReleases(releases) };
-        }
-
-        private async Task<NewznabResults> BasicSearch(NewznabRequest request, List<int> indexerIds, bool interactiveSearch)
-        {
-            var searchSpec = Get<BasicSearchCriteria>(request, indexerIds, interactiveSearch);
-
-            var releases = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
-
-            return new NewznabResults { Releases = DeDupeReleases(releases) };
+                        return (searchSpec, indexer => indexer.Fetch(searchSpec));
+                    }
+            }
         }
 
         private TSpec Get<TSpec>(NewznabRequest query, List<int> indexerIds, bool interactiveSearch)
@@ -156,7 +179,7 @@ namespace NzbDrone.Core.IndexerSearch
             return spec;
         }
 
-        private async Task<IList<ReleaseInfo>> Dispatch(Func<IIndexer, Task<IndexerPageableQueryResult>> searchAction, SearchCriteriaBase criteriaBase)
+        private async Task<IList<ReleaseInfo>> Dispatch(Func<IIndexer, Task<IndexerPageableQueryResult>> searchAction, SearchCriteriaBase criteriaBase, Action<IList<ReleaseInfo>> publish = null)
         {
             var indexers = _indexerFactory.Enabled();
 
@@ -190,7 +213,47 @@ namespace NzbDrone.Core.IndexerSearch
 
             _logger.ProgressInfo("Searching indexer(s): [{0}] for {1}", string.Join(", ", indexers.Select(i => i.Definition.Name).ToList()), criteriaBase.ToString());
 
-            var tasks = indexers.Select(x => DispatchIndexer(searchAction, x, criteriaBase));
+            Action<IList<ReleaseInfo>> emit = null;
+
+            if (publish != null)
+            {
+                var seenGuids = new HashSet<string>();
+                var indexersById = indexers.GroupBy(i => i.Definition.Id).ToDictionary(g => g.Key, g => g.First());
+
+                // Serializes concurrent indexer callbacks and de-dupes so each guid is published once.
+                emit = releases =>
+                {
+                    List<ReleaseInfo> fresh;
+
+                    lock (seenGuids)
+                    {
+                        fresh = releases.Where(r => seenGuids.Add(r.Guid ?? string.Empty)).ToList();
+
+                        if (fresh.Count > 0)
+                        {
+                            publish(fresh);
+                        }
+                    }
+                };
+
+                criteriaBase.ReleasesAvailable = (indexerId, releases) =>
+                {
+                    if (indexersById.TryGetValue(indexerId, out var indexer))
+                    {
+                        emit(ApplyFilters(indexer, releases, criteriaBase));
+                    }
+                };
+            }
+
+            var tasks = indexers.Select(async x =>
+            {
+                var releases = await DispatchIndexer(searchAction, x, criteriaBase);
+
+                // Publishes anything an indexer returned without progressive callbacks (already-seen guids are skipped).
+                emit?.Invoke(releases);
+
+                return releases;
+            }).ToList();
 
             var batch = await Task.WhenAll(tasks);
 
@@ -212,48 +275,7 @@ namespace NzbDrone.Core.IndexerSearch
             {
                 var indexerReports = await searchAction(indexer);
 
-                var releases = indexerReports.Releases;
-
-                //Filter results to only those in searched categories
-                if (criteriaBase.Categories.Length > 0)
-                {
-                    var expandedQueryCats = indexer.GetCapabilities().Categories.ExpandTorznabQueryCategories(criteriaBase.Categories);
-
-                    releases = releases.Where(result => result.Categories?.Any() != true || expandedQueryCats.Intersect(result.Categories.Select(c => c.Id)).Any()).ToList();
-
-                    if (releases.Count != indexerReports.Releases.Count)
-                    {
-                        _logger.Trace("{0} releases from {1} ({2}) which didn't contain search categories [{3}] were filtered", indexerReports.Releases.Count - releases.Count, ((IndexerDefinition)indexer.Definition).Name, indexer.Name, string.Join(", ", expandedQueryCats));
-                    }
-                }
-
-                if (criteriaBase.MinAge is > 0)
-                {
-                    var cutoffDate = DateTime.UtcNow.Subtract(TimeSpan.FromDays(criteriaBase.MinAge.Value));
-
-                    releases = releases.Where(r => r.PublishDate <= cutoffDate).ToList();
-                }
-
-                if (criteriaBase.MaxAge is > 0)
-                {
-                    var cutoffDate = DateTime.UtcNow.Subtract(TimeSpan.FromDays(criteriaBase.MaxAge.Value));
-
-                    releases = releases.Where(r => r.PublishDate >= cutoffDate).ToList();
-                }
-
-                if (criteriaBase.MinSize is > 0)
-                {
-                    var minSize = criteriaBase.MinSize.Value;
-
-                    releases = releases.Where(r => r.Size >= minSize).ToList();
-                }
-
-                if (criteriaBase.MaxSize is > 0)
-                {
-                    var maxSize = criteriaBase.MaxSize.Value;
-
-                    releases = releases.Where(r => r.Size <= maxSize).ToList();
-                }
+                var releases = ApplyFilters(indexer, indexerReports.Releases, criteriaBase);
 
                 foreach (var query in indexerReports.Queries)
                 {
@@ -262,6 +284,10 @@ namespace NzbDrone.Core.IndexerSearch
 
                 return releases;
             }
+            catch (OperationCanceledException) when (criteriaBase.CancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception e)
             {
                 _eventAggregator.PublishEvent(new IndexerQueryEvent(indexer.Definition.Id, criteriaBase, new IndexerQueryResult()));
@@ -269,6 +295,54 @@ namespace NzbDrone.Core.IndexerSearch
             }
 
             return Array.Empty<ReleaseInfo>();
+        }
+
+        private IList<ReleaseInfo> ApplyFilters(IIndexer indexer, IList<ReleaseInfo> releases, SearchCriteriaBase criteriaBase)
+        {
+            var original = releases;
+
+            //Filter results to only those in searched categories
+            if (criteriaBase.Categories.Length > 0)
+            {
+                var expandedQueryCats = indexer.GetCapabilities().Categories.ExpandTorznabQueryCategories(criteriaBase.Categories);
+
+                releases = releases.Where(result => result.Categories?.Any() != true || expandedQueryCats.Intersect(result.Categories.Select(c => c.Id)).Any()).ToList();
+
+                if (releases.Count != original.Count)
+                {
+                    _logger.Trace("{0} releases from {1} ({2}) which didn't contain search categories [{3}] were filtered", original.Count - releases.Count, ((IndexerDefinition)indexer.Definition).Name, indexer.Name, string.Join(", ", expandedQueryCats));
+                }
+            }
+
+            if (criteriaBase.MinAge is > 0)
+            {
+                var cutoffDate = DateTime.UtcNow.Subtract(TimeSpan.FromDays(criteriaBase.MinAge.Value));
+
+                releases = releases.Where(r => r.PublishDate <= cutoffDate).ToList();
+            }
+
+            if (criteriaBase.MaxAge is > 0)
+            {
+                var cutoffDate = DateTime.UtcNow.Subtract(TimeSpan.FromDays(criteriaBase.MaxAge.Value));
+
+                releases = releases.Where(r => r.PublishDate >= cutoffDate).ToList();
+            }
+
+            if (criteriaBase.MinSize is > 0)
+            {
+                var minSize = criteriaBase.MinSize.Value;
+
+                releases = releases.Where(r => r.Size >= minSize).ToList();
+            }
+
+            if (criteriaBase.MaxSize is > 0)
+            {
+                var maxSize = criteriaBase.MaxSize.Value;
+
+                releases = releases.Where(r => r.Size <= maxSize).ToList();
+            }
+
+            return releases;
         }
 
         private List<ReleaseInfo> DeDupeReleases(IList<ReleaseInfo> releases)

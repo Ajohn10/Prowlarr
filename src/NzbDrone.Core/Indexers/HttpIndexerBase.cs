@@ -404,6 +404,7 @@ namespace NzbDrone.Core.Indexers
             var result = new IndexerPageableQueryResult();
             var url = string.Empty;
             var minimumBackoff = TimeSpan.FromHours(1);
+            var streamed = searchCriteria.ReleasesAvailable != null ? new List<ReleaseInfo>() : null;
 
             try
             {
@@ -415,6 +416,7 @@ namespace NzbDrone.Core.Indexers
                 };
 
                 var pageableRequestChain = pageableRequestChainSelector(generator);
+                var streamedGuids = streamed != null ? new HashSet<string>() : null;
 
                 for (var i = 0; i < pageableRequestChain.Tiers; i++)
                 {
@@ -428,7 +430,10 @@ namespace NzbDrone.Core.Indexers
 
                         foreach (var request in pageableRequest)
                         {
+                            searchCriteria.CancellationToken.ThrowIfCancellationRequested();
+
                             url = request.Url.FullUri;
+                            request.HttpRequest.CancellationToken = searchCriteria.CancellationToken;
 
                             var page = await FetchPage(request, parser);
 
@@ -437,6 +442,19 @@ namespace NzbDrone.Core.Indexers
                             result.Queries.Add(page);
 
                             pagedReleases.AddRange(page.Releases);
+
+                            if (streamed != null)
+                            {
+                                var newReleases = CleanupReleases(page.Releases.Where(r => IsValidRelease(r, searchCriteria.InteractiveSearch)), searchCriteria)
+                                    .Where(r => streamedGuids.Add(r.Guid ?? string.Empty))
+                                    .ToList();
+
+                                if (newReleases.Any())
+                                {
+                                    streamed.AddRange(newReleases);
+                                    searchCriteria.ReleasesAvailable(Definition.Id, newReleases);
+                                }
+                            }
 
                             if (!IsFullPage(page.Releases, pageSize))
                             {
@@ -454,6 +472,11 @@ namespace NzbDrone.Core.Indexers
                 }
 
                 _indexerStatusService.RecordSuccess(Definition.Id);
+            }
+            catch (OperationCanceledException) when (searchCriteria.CancellationToken.IsCancellationRequested)
+            {
+                // Caller aborted: not an indexer failure, so don't record status or swallow.
+                throw;
             }
             catch (WebException webException)
             {
@@ -540,7 +563,7 @@ namespace NzbDrone.Core.Indexers
                 _logger.Error(ex, "An error occurred while processing indexer feed. [{0}]", url);
             }
 
-            result.Releases = CleanupReleases(releases, searchCriteria);
+            result.Releases = streamed ?? CleanupReleases(releases, searchCriteria);
 
             return result;
         }
@@ -667,7 +690,7 @@ namespace NzbDrone.Core.Indexers
             request.HttpRequest.Encoding ??= Encoding;
 
             var response = await RetryStrategy
-                .ExecuteAsync(static async (state, _) => await state._httpClient.ExecuteProxiedAsync(state.HttpRequest, state.Definition), (_httpClient, request.HttpRequest, Definition))
+                .ExecuteAsync(static async (state, _) => await state._httpClient.ExecuteProxiedAsync(state.HttpRequest, state.Definition), (_httpClient, request.HttpRequest, Definition), request.HttpRequest.CancellationToken)
                 .ConfigureAwait(false);
 
             // Check response to see if auth is needed, if needed try again
