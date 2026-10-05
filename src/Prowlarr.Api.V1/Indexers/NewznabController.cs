@@ -177,7 +177,21 @@ namespace NzbDrone.Api.V1.Indexers
                 case "music":
                 case "book":
                 case "movie":
-                    var results = await _releaseSearchService.Search(request, new List<int> { indexerDef.Id }, false);
+                    if (NewznabNdjson.IsAccepted(Request.Headers.Accept))
+                    {
+                        return await StreamSearchResponse(request, indexerDef, indexer);
+                    }
+
+                    NewznabResults results;
+
+                    try
+                    {
+                        results = await _releaseSearchService.Search(request, new List<int> { indexerDef.Id }, false, HttpContext.RequestAborted);
+                    }
+                    catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+                    {
+                        return new EmptyResult();
+                    }
 
                     var blockedIndexerStatusPost = GetBlockedIndexerStatus(indexer);
 
@@ -188,22 +202,113 @@ namespace NzbDrone.Api.V1.Indexers
                         return CreateResponse(CreateErrorXML(429, $"Indexer is disabled till {blockedIndexerStatusPost.DisabledTill.Value.ToLocalTime()} due to recent failures."), statusCode: StatusCodes.Status429TooManyRequests);
                     }
 
-                    foreach (var result in results.Releases)
-                    {
-                        result.DownloadUrl = result.DownloadUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(result.DownloadUrl), request.server, indexerDef.Id, result.Title).AbsoluteUri : null;
+                    ApplyProxyLinks(results.Releases, request.server, indexerDef.Id);
 
-                        if (result.DownloadProtocol == DownloadProtocol.Torrent)
-                        {
-                            ((TorrentInfo)result).MagnetUrl = ((TorrentInfo)result).MagnetUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(((TorrentInfo)result).MagnetUrl), request.server, indexerDef.Id, result.Title).AbsoluteUri : null;
-                        }
-                    }
-
-                    var preferMagnetUrl = indexer.Protocol == DownloadProtocol.Torrent && indexerDef.Settings is ITorrentIndexerSettings torrentIndexerSettings && (torrentIndexerSettings.TorrentBaseSettings?.PreferMagnetUrl ?? false);
-
-                    return CreateResponse(results.ToXml(indexer.Protocol, preferMagnetUrl));
+                    return CreateResponse(results.ToXml(indexer.Protocol, PreferMagnetUrl(indexer, indexerDef)));
                 default:
                     return CreateResponse(CreateErrorXML(202, $"No such function ({requestType})"), statusCode: StatusCodes.Status400BadRequest);
             }
+        }
+
+        private async Task<IActionResult> StreamSearchResponse(NewznabRequest request, IndexerDefinition indexerDef, IIndexer indexer)
+        {
+            var cancellationToken = HttpContext.RequestAborted;
+            var preferMagnetUrl = PreferMagnetUrl(indexer, indexerDef);
+            var protocol = indexer.Protocol;
+            var batches = 0;
+            var releaseCount = 0;
+
+            await using var stream = _releaseSearchService.SearchStream(request, new List<int> { indexerDef.Id }, false, cancellationToken);
+
+            Response.StatusCode = StatusCodes.Status200OK;
+            Response.ContentType = $"{NewznabNdjson.MediaType}; charset=utf-8";
+            Response.Headers.CacheControl = "no-store";
+            Response.Headers["X-Accel-Buffering"] = "no";
+
+            try
+            {
+                await Response.StartAsync(cancellationToken);
+
+                await NewznabNdjson.WriteAsync(Response.Body, new NdjsonStart { IndexerId = indexerDef.Id, Protocol = protocol == DownloadProtocol.Torrent ? "torrent" : "usenet" }, cancellationToken);
+
+                await foreach (var releases in stream.ReadAllAsync(cancellationToken))
+                {
+                    ApplyProxyLinks(releases, request.server, indexerDef.Id);
+
+                    batches++;
+                    releaseCount += releases.Count;
+
+                    await NewznabNdjson.WriteAsync(
+                        Response.Body,
+                        new NdjsonBatch
+                        {
+                            Sequence = batches,
+                            Releases = releases.Select(r => NewznabNdjson.ToDto(r, protocol, preferMagnetUrl)).ToList()
+                        },
+                        cancellationToken);
+                }
+
+                var blockedIndexerStatus = GetBlockedIndexerStatus(indexer);
+
+                if (blockedIndexerStatus?.DisabledTill != null)
+                {
+                    await NewznabNdjson.WriteAsync(
+                        Response.Body,
+                        new NdjsonError
+                        {
+                            Code = StatusCodes.Status429TooManyRequests,
+                            Message = $"Indexer is disabled till {blockedIndexerStatus.DisabledTill.Value.ToLocalTime()} due to recent failures.",
+                            RetryAfterSeconds = Math.Max(CalculateRetryAfterDisabledTill(blockedIndexerStatus.DisabledTill.Value), 0),
+                            Batches = batches,
+                            ReleaseCount = releaseCount
+                        },
+                        cancellationToken);
+                }
+                else
+                {
+                    await NewznabNdjson.WriteAsync(Response.Body, new NdjsonComplete { Batches = batches, ReleaseCount = releaseCount }, cancellationToken);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Client disconnected; disposing the stream cancels outstanding indexer requests.
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.Error(ex, "Streaming search failed for indexer {0}", indexerDef.Name);
+
+                try
+                {
+                    await NewznabNdjson.WriteAsync(
+                        Response.Body,
+                        new NdjsonError { Code = StatusCodes.Status500InternalServerError, Message = ex.Message, Batches = batches, ReleaseCount = releaseCount },
+                        cancellationToken);
+                }
+                catch (Exception writeEx)
+                {
+                    _logger.Debug(writeEx, "Unable to write streaming error frame");
+                }
+            }
+
+            return new EmptyResult();
+        }
+
+        private void ApplyProxyLinks(IEnumerable<ReleaseInfo> releases, string server, int indexerId)
+        {
+            foreach (var result in releases)
+            {
+                result.DownloadUrl = result.DownloadUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(result.DownloadUrl), server, indexerId, result.Title).AbsoluteUri : null;
+
+                if (result.DownloadProtocol == DownloadProtocol.Torrent)
+                {
+                    ((TorrentInfo)result).MagnetUrl = ((TorrentInfo)result).MagnetUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(((TorrentInfo)result).MagnetUrl), server, indexerId, result.Title).AbsoluteUri : null;
+                }
+            }
+        }
+
+        private static bool PreferMagnetUrl(IIndexer indexer, IndexerDefinition indexerDef)
+        {
+            return indexer.Protocol == DownloadProtocol.Torrent && indexerDef.Settings is ITorrentIndexerSettings torrentIndexerSettings && (torrentIndexerSettings.TorrentBaseSettings?.PreferMagnetUrl ?? false);
         }
 
         [HttpGet("/api/v1/indexer/{id:int}/download")]

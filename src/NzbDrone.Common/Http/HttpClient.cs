@@ -161,7 +161,7 @@ namespace NzbDrone.Common.Http
 
             if (request.RateLimit != TimeSpan.Zero)
             {
-                await _rateLimitService.WaitAndPulseAsync(request.Url.Host, request.RateLimit);
+                await _rateLimitService.WaitAndPulseAsync(request.Url.Host, request.RateLimit).WaitAsync(request.CancellationToken);
             }
 
             _logger.Trace(request);

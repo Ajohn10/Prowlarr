@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Threading;
 using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http.Proxy;
@@ -55,6 +56,7 @@ namespace NzbDrone.Common.Http
         public TimeSpan RequestTimeout { get; set; }
         public TimeSpan RateLimit { get; set; }
         public Stream ResponseStream { get; set; }
+        public CancellationToken CancellationToken { get; set; }
 
         public override string ToString()
         {

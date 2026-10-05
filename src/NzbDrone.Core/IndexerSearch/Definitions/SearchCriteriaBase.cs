@@ -1,7 +1,10 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
 using NzbDrone.Common.Extensions;
+using NzbDrone.Core.Parser.Model;
 
 namespace NzbDrone.Core.IndexerSearch.Definitions
 {
@@ -23,6 +26,13 @@ namespace NzbDrone.Core.IndexerSearch.Definitions
         public long? MaxSize { get; set; }
         public string Source { get; set; }
         public string Host { get; set; }
+
+        // Propagated to indexer HTTP requests so an aborted caller stops in-flight work.
+        public CancellationToken CancellationToken { get; set; }
+
+        // Optional progressive hook: invoked with (indexerId, cleaned releases) as each result page completes.
+        // May be called concurrently from different indexers; the handler must be thread-safe.
+        public Action<int, IList<ReleaseInfo>> ReleasesAvailable { get; set; }
 
         public override string ToString() => $"{SearchQuery}, Offset: {Offset ?? 0}, Limit: {Limit ?? 0}, Categories: [{string.Join(", ", Categories)}]";
 
